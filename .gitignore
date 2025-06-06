@@ -1,0 +1,5 @@
+# ignore venv
+.venv
+
+# ignore point cloud files due to size
+PointCloud

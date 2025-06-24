@@ -2,17 +2,35 @@ import open3d as o3d
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import ConvexHull
+from matplotlib.path import Path
 
-# variant which filters and then fix tilt
+def box_location(pcd: o3d.geometry.PointCloud, 
+                      bbox_pix) -> o3d.geometry.PointCloud:
+    eps = 1e-9
+    u = (intrinsics["fx"] * pts[:,0]) / (pts[:,2] + eps) + intrinsics["cx"]
+    v = (intrinsics["fy"] * pts[:,1]) / (pts[:,2] + eps) + intrinsics["cy"]
+    uv = np.c_[u, v]      
+
+    x1, y1, x2, y2 = bbox_pix
+    inside = (uv[:,0] >= x1) & (uv[:,0] <= x2) & \
+            (uv[:,1] >= y1) & (uv[:,1] <= y2)
+
+    print(f"Total points in cloud : {len(pcd.points):,}")
+    print(f"Points that fall in 2-D BBox : {inside.sum():,}")
+
+    col = np.zeros((len(pcd.points),3))
+    col[:] = [0.7,0.7,0.7]          # grey
+    col[inside] = [1, 0.706, 0]   # Yellow
+    pcd.colors = o3d.utility.Vector3dVector(col)
+
+    return pcd
+
 def level_and_filter(pcd: o3d.geometry.PointCloud,
                      distance_thresh=0.002,
                      num_iters=1000,
-                     z_margin=0.005) -> o3d.geometry.PointCloud:
-    """
-    1) RANSAC‐fit the dominant plane (table) and rotate it horizontal.
-    2) Remove all points whose Z is below (table_z + z_margin).
-    """
-    # Fit table and build leveling transform ---
+                     z_min=0.005,
+                     z_max=0.025) -> o3d.geometry.PointCloud:
+    # Fit table and build leveling transform
     (a, b, c, d), inliers = pcd.segment_plane(distance_thresh,
                                               ransac_n=3,
                                               num_iterations=num_iters)
@@ -39,26 +57,94 @@ def level_and_filter(pcd: o3d.geometry.PointCloud,
     pcd = pcd.rotate(R, center=(0, 0, 0))
     pcd = pcd.translate(centroid, relative=False)
 
-    # Height filter in leveled frame ---
+    # Height filter in leveled frame
     # after leveling, the table plane goes through z = centroid[2]
     table_z = centroid[2]
     pts = np.asarray(pcd.points)
-    keep = pts[:, 2] <= (table_z + z_margin)
 
-    return pcd.select_by_index(np.where(keep)[0])
+    # Initialize mask to keep all points first
+    mask = np.ones(len(pts), dtype=bool)
 
-# Fit a plane to the point cloud using RANSAC, similar to level_cloud using RANSAC
+    if z_min is not None:
+        mask &= pts[:, 2] <= (table_z + z_min) # filter out all points below the segmented table + certain height
+    if z_max is not None:
+        mask &= pts[:, 2] >= (table_z - z_max) # filter out all points above the segmented table + certain height
+
+    return pcd.select_by_index(np.where(mask)[0])
+
 def plane_fit(cloud, thresh=0.005, n_iter=1000):
-    # Fit with RANSAC
     (a, b, c, d), inliers = cloud.segment_plane(thresh, ransac_n=3, num_iterations=n_iter)
-     # Normalize the normal vector and d value
+    
+    # Normalize
     n = np.array([a, b, c])
     norm = np.linalg.norm(n)
     n /= norm
     d /= norm
+
     return n, d, inliers
 
-def compute_2d_obb_from_lid(lid_pc: o3d.geometry.PointCloud):
+def plane_fit_horizontal(cloud, thresh=0.005, n_iter=1000, max_tilt_deg=15, visualize=True):
+    (a, b, c, d), inliers = cloud.segment_plane(thresh, ransac_n=3, num_iterations=n_iter)
+    
+    # Normalize
+    n = np.array([a, b, c])
+    norm = np.linalg.norm(n)
+    n /= norm
+    d /= norm
+
+    # Check angle between plane normal and Z-axis
+    cos_theta = np.abs(np.dot(n, [0, 0, 1]))  # |cos(θ)| where θ is angle with Z
+    angle_deg = np.arccos(cos_theta) * (180.0 / np.pi)
+
+    if angle_deg > max_tilt_deg:
+        print(f"Rejected plane: tilt angle {angle_deg:.2f}° > {max_tilt_deg}° (not horizontal enough)")
+        return None, None, None
+
+    return n, d, inliers
+
+def extract_largest_yellow_cluster(
+    obj_pc: o3d.geometry.PointCloud,
+    *,
+    eps: float = 0.01,
+    min_points: int = 20,
+    yellow_rgb: tuple[float, float, float] = (1.0, 0.706, 0.0),
+    threshold: float = 0.50,
+    visualize: bool = False,
+    window_name: str | None = None,
+) -> o3d.geometry.PointCloud:
+    # DBSCAN cluster
+    labels = np.asarray(obj_pc.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
+
+    # Build a boolean mask for yellow points
+    yellow_rgb = np.asarray(yellow_rgb)
+    col_obj    = np.asarray(obj_pc.colors)
+    yellow_mask = np.all(np.isclose(col_obj, yellow_rgb, atol=1e-3), axis=1)
+
+    # Select the best cluster
+    best_lbl, best_size = -1, -1
+    for lbl in np.unique(labels[labels >= 0]):  # iterate over real clusters
+        idx   = labels == lbl                   # mask for this cluster
+        ratio = yellow_mask[idx].sum() / idx.sum()
+
+        if ratio >= threshold and idx.sum() > best_size:
+            best_lbl, best_size = lbl, idx.sum()
+
+    if best_lbl == -1:
+        raise RuntimeError(
+            f"No cluster had ≥{int(threshold * 100)} % of its points in the yellow ROI."
+        )
+
+    # Extract and show the cluster if needed
+    box_pc = obj_pc.select_by_index(np.where(labels == best_lbl)[0])
+    if visualize:
+        if window_name is None:
+            window_name = f"Largest cluster ≥{int(threshold * 100)} % yellow"
+        box_pc.paint_uniform_color([0.2, 0.8, 1.0])  # cyan
+        o3d.visualization.draw_geometries([box_pc], window_name=window_name)
+
+    return box_pc
+
+def compute_2d_obb_from_lid(lid_pc):
     # Get XY coordinates of lid points (project to 2D)
     points = np.asarray(lid_pc.points)
     xy = points[:, :2]  # Ignore Z
@@ -115,69 +201,167 @@ def compute_2d_obb_from_lid(lid_pc: o3d.geometry.PointCloud):
     length, width = np.abs(max_xy - min_xy)
     return corners_3d, length, width
 
-if __name__ == '__main__':
-    # Load the raw point cloud
-    MM_TO_M = 1 / 1000.0
-    pcd_path = "PointCloud/PointCloud_box_a1.pcd" # only a3 has problem due to sparse top
+def lid_coverage(box_pc):
+    # RANSAC to find dominant plane (lid) + hollow check
+    n_lid, d_lid, lid_inliers = plane_fit_horizontal(box_pc)
+
+    # if plane is not horizontal enough, return None
+    if lid_inliers is None: 
+        return None, None, None, None, 0
+    
+    lid_pc = box_pc.select_by_index(lid_inliers)
+
+    # Project inliers to XY and compute their 2D convex hull
+    pts2d = np.asarray(lid_pc.points)[:, :2]
+    hull = ConvexHull(pts2d)
+    hull_pts = pts2d[hull.vertices]
+
+    # Build a 2D polygon for point-in-hull tests
+    poly = Path(hull_pts)
+
+    # Create a grid covering the hull's bounding box
+    grid_size = 50
+    min_xy = hull_pts.min(axis=0)
+    max_xy = hull_pts.max(axis=0)
+    cell_size = (max_xy - min_xy) / grid_size
+
+    # Which grid‐cell centers are inside the hull?
+    x_centers = min_xy[0] + (np.arange(grid_size) + 0.5) * cell_size[0]
+    y_centers = min_xy[1] + (np.arange(grid_size) + 0.5) * cell_size[1]
+    XX, YY = np.meshgrid(x_centers, y_centers)
+    centers = np.vstack([XX.ravel(), YY.ravel()]).T
+    inside = poly.contains_points(centers).reshape(grid_size, grid_size)
+
+    # Mark which cells have at least one lid point
+    filled = np.zeros_like(inside)
+    idx = ((pts2d - min_xy) / cell_size).astype(int)
+    idx[:, 0] = np.clip(idx[:, 0], 0, grid_size - 1)
+    idx[:, 1] = np.clip(idx[:, 1], 0, grid_size - 1)
+    # Note: idx rows are [i, j] = [x_index, y_index]
+    filled[idx[:, 1], idx[:, 0]] = True
+
+    # Compute coverage = filled cells inside hull / total hull cells
+    coverage = filled[inside].sum() / inside.sum()
+    print(f"Lid coverage: {coverage:.2%}")
+
+    return n_lid, d_lid, lid_inliers, lid_pc, coverage
+
+def top_percentile_obb(box_pc, percentile=10):
+    # Pull out raw points
+    pts = np.asarray(box_pc.points)
+    zs  = pts[:, 2]
+
+    # Threshold at the desired percentile
+    z_thr   = np.percentile(zs, percentile)
+    top_idx = np.where(zs <= z_thr)[0]
+    top_pts = pts[top_idx]               # shape (M, 3)
+
+    # Build a temp Open3D cloud of just those top points
+    temp_pc = o3d.geometry.PointCloud()
+    temp_pc.points = o3d.utility.Vector3dVector(top_pts)
+
+    # Now call your existing plane‐to‐OBB function
+    corners, length, width = compute_2d_obb_from_lid(temp_pc)
+
+    return corners, length, width
+
+def estimate_box_dimensions(box_pc, coverage, lid_inliers, d_lid, d_tab, lid_pc):
+    # If RANSAC hull is too hollow or no inliers (if angle is too tilted for RANSAC), fall back to top‐percentile outline
+    if (coverage < 0.7) or (lid_inliers == None):
+        corners, length, width = top_percentile_obb(box_pc, percentile=20) # top 20 percent of box is used to project to 2D then find XY
+        # Compute height from the top 5% of points
+        pts = np.asarray(box_pc.points)
+        zs  = pts[:, 2]
+
+        # want the top 1%, so use 99th percentile threshold, for height level
+        z_thr   = np.percentile(zs, 1)
+        top_idx = np.where(zs <= z_thr)[0]
+        top_pts = pts[top_idx]
+
+        # Use the mean (or max) Z of those as your lid height
+        z_lid_est = top_pts[:, 2].mean()
+
+        # Get diff between top of box and table
+        height_m = abs(z_lid_est + d_tab)
+
+    else:
+        corners, length, width = compute_2d_obb_from_lid(lid_pc) # standard method of projecting to 2D then find XY
+
+        # Get diff between top of box and table
+        height_m = abs(d_lid - d_tab)
+
+    print(f"Box ≈ {length*100:.2f} × {width*100:.2f} × {height_m*100:.2f} cm  (L×W×H)")
+
+if __name__ == "__main__":
+    # Camera parameters
+    intrinsics = dict(fx=617.0, fy=617.0, cx=319.5, cy=239.5) # <- camera dimensions
+
+    # Load in data and box input coordinate base on 5 samples
+    box_num = input("Enter the experiment number (e.g. e1, e2, e3, e4 big, e4 small, e5): ")
+    if box_num == "e1":
+        pcd_path = "Phase_2_PCD/PointCloud_e1.pcd" # <- full path to your .pcd file
+        Box_corners = [214.18213, 253.65614, 435.97366, 366.13275]
+    elif box_num == "e2":
+        pcd_path = "Phase_2_PCD/PointCloud_e2.pcd"
+        Box_corners = [338.89346, 268.44052, 519.0965 , 439.19873]
+    elif box_num == "e3":
+        pcd_path = "Phase_2_PCD/PointCloud_e3.pcd"
+        Box_corners = [338.1808 , 250.50539, 519.58405, 478.66837]
+    elif box_num == "e4 big":
+        pcd_path = "Phase_2_PCD/PointCloud_e4.pcd"
+        Box_corners = [79.322464, 192.35791 , 254.25697 , 366.5183]
+    elif box_num == "e4 small":
+        pcd_path = "Phase_2_PCD/PointCloud_e4.pcd"
+        Box_corners = [385.79095 , 286.39618 , 460.3058  , 370.37234]
+    elif box_num == "e5":
+        pcd_path = "Phase_2_PCD/PointCloud_e5.pcd"
+        Box_corners = [182.18625, 223.96574, 460.8647 , 412.31375]
+    else:
+        raise ValueError("Invalid experiment number")
+    
+    bbox_pix = np.array(Box_corners) 
+
+    # load the point cloud
     pcd = o3d.io.read_point_cloud(pcd_path)
+    pts = np.asarray(pcd.points) # shape = (N,3)
+
+    # Find box location
+    pcd = box_location(pcd, bbox_pix)
 
     # Convert units (assumes points are in mm)
+    MM_TO_M = 1 / 1000.0
     points = np.asarray(pcd.points, dtype=np.float64) * MM_TO_M
     pcd.points = o3d.utility.Vector3dVector(points)
 
-    filtered_pcd = level_and_filter(pcd,
-                            distance_thresh=0.002,
-                            num_iters=1000,
-                            z_margin=0.005)
-    
-    # Fit a plane to for finding table
-    n_tab, d_tab, table_inliers = plane_fit(filtered_pcd) # Finds the table plane, extract normal vecotr (n_tab) and offset (d_tab)
-    table_pc = filtered_pcd.select_by_index(table_inliers) # table object (dominant flat plane)
-    obj_pc = filtered_pcd.select_by_index(table_inliers, invert=True) # all other object, found by using invert=True
+    # Level and filter
+    pcd = level_and_filter(pcd,
+                        distance_thresh=0.003, # how tightly the plane fitting should hug the data, 2mm
+                        num_iters=1000,
+                        z_min=0, # 25mm (0.025) default, extra margin at bottom of table for filtering below
+                        z_max=0.250) # 250mm (0.250) default, filter all points above the table
 
-    # Cluster to find box
-    labels = np.array(obj_pc.cluster_dbscan(eps=0.02, min_points=20)) # DBSCAN clustering
-    largest = np.bincount(labels[labels >= 0]).argmax() # Finds the most populated cluster (assumed to be the box)
-    box_pc = obj_pc.select_by_index(np.where(labels == largest)[0]) # Selects only the points that belong to the largest cluster.
+    # Find table plane
+    n_tab, d_tab, table_inliers = plane_fit_horizontal(pcd, thresh=0.005) # Finds the table plane
 
-    # RANSAC to find dominant plane of the box (box_pc), this will be top of box AKA lid
-    n_lid, d_lid, lid_inliers = plane_fit(box_pc)
-    lid_pc = box_pc.select_by_index(lid_inliers)
+    # Error check (i.e. no table founded)
+    if table_inliers == None:
+        raise Exception("No table detected")
 
-    # Find lid dimensions
-    corners, length, width = compute_2d_obb_from_lid(lid_pc)
+    # Find table centroid
+    table_pc = pcd.select_by_index(table_inliers) # table object (dominant flat plane)
+    obj_pc = pcd.select_by_index(table_inliers, invert=True) # all other object, found by using invert=True
 
-    # Height from plane offset difference
-    height_m = abs(d_lid - d_tab)
+    # Find box cluster
+    box_pc = extract_largest_yellow_cluster(obj_pc, eps=0.015, min_points=30, threshold=0.6, visualize=True)
 
-    # Final dimensions in cm
-    dims_cm = np.array([length, width, height_m]) * 100.0
-    print(f"Box ≈ {dims_cm[0]:.2f} × {dims_cm[1]:.2f} × {dims_cm[2]:.2f} cm  (L×W×H)")
+    # RANSAC to find lid (dominant plane), this will be top of box (or side, or hollow), also get lid coverage
+    n_lid, d_lid, lid_inliers, lid_pc, coverage = lid_coverage(box_pc)
 
-    # Visualize -------------
-    # Set bounding line for lid color
-    lines = [[0,1],[1,2],[2,3],[3,0]]
-    colors = [[1, 0.5, 0] for _ in lines]  # orange
+    # Estimate box dimensions
+    estimate_box_dimensions(box_pc, coverage, lid_inliers, d_lid, d_tab, lid_pc)
 
-    line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(corners),
-        lines=o3d.utility.Vector2iVector(lines),
-    )
-    line_set.colors = o3d.utility.Vector3dVector(colors)
-
-    # Create table bounding boxes
-    table_obj = table_pc.get_oriented_bounding_box()
-
-    # Set colors
-    table_obj.color = (1.0, 0.0, 0.0)
-    table_pc.paint_uniform_color([1.0, 0.0, 0.0]) # table = red
-    lid_pc.paint_uniform_color([0.0, 1.0, 0.0]) # lid = green
-    box_pc.paint_uniform_color([0.2, 0.8, 1.0]) # box body = cyan
-
-    o3d.visualization.draw_geometries(
-        [table_pc, lid_pc, box_pc, line_set, table_obj],
-        window_name="Final Visualization: Table, Lid, Box, OBB",
-        width=800, height=600
-    )
-
-    
+    # visualize
+    obj_pc.paint_uniform_color([1, 0, 0]) # red
+    box_pc.paint_uniform_color([0.2, 0.8, 1.0]) # cyan
+    lid_pc.paint_uniform_color([0, 1, 0]) # green
+    o3d.visualization.draw_geometries([lid_pc, box_pc, table_pc, obj_pc])

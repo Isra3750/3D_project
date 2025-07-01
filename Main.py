@@ -72,7 +72,9 @@ def level_and_filter(pcd: o3d.geometry.PointCloud,
 
     return pcd.select_by_index(np.where(mask)[0])
 
-def plane_fit(cloud, thresh=0.005, n_iter=1000):
+def plane_fit(cloud: o3d.geometry.PointCloud, 
+              thresh=0.005, 
+              n_iter=1000):
     (a, b, c, d), inliers = cloud.segment_plane(thresh, ransac_n=3, num_iterations=n_iter)
     
     # Normalize
@@ -81,9 +83,13 @@ def plane_fit(cloud, thresh=0.005, n_iter=1000):
     n /= norm
     d /= norm
 
-    return n, d, inliers
+    return n, d, inliers # d is the offset
 
-def plane_fit_horizontal(cloud, thresh=0.005, n_iter=1000, max_tilt_deg=15, visualize=True):
+def plane_fit_horizontal(cloud: o3d.geometry.PointCloud, 
+                         thresh=0.005, 
+                         n_iter=1000, 
+                         max_tilt_deg=15, 
+                         visualize=True):
     (a, b, c, d), inliers = cloud.segment_plane(thresh, ransac_n=3, num_iterations=n_iter)
     
     # Normalize
@@ -100,7 +106,7 @@ def plane_fit_horizontal(cloud, thresh=0.005, n_iter=1000, max_tilt_deg=15, visu
         print(f"Rejected plane: tilt angle {angle_deg:.2f}° > {max_tilt_deg}° (not horizontal enough)")
         return None, None, None
 
-    return n, d, inliers
+    return n, d, inliers # d is the offset
 
 def extract_largest_yellow_cluster(
     obj_pc: o3d.geometry.PointCloud,
@@ -144,7 +150,7 @@ def extract_largest_yellow_cluster(
 
     return box_pc
 
-def compute_2d_obb_from_lid(lid_pc):
+def compute_2d_obb_from_lid(lid_pc: o3d.geometry.PointCloud):
     # Get XY coordinates of lid points (project to 2D)
     points = np.asarray(lid_pc.points)
     xy = points[:, :2]  # Ignore Z
@@ -201,7 +207,7 @@ def compute_2d_obb_from_lid(lid_pc):
     length, width = np.abs(max_xy - min_xy)
     return corners_3d, length, width
 
-def lid_coverage(box_pc):
+def lid_coverage(box_pc: o3d.geometry.PointCloud):
     # RANSAC to find dominant plane (lid) + hollow check
     n_lid, d_lid, lid_inliers = plane_fit_horizontal(box_pc)
 
@@ -246,7 +252,8 @@ def lid_coverage(box_pc):
 
     return n_lid, d_lid, lid_inliers, lid_pc, coverage
 
-def top_percentile_obb(box_pc, percentile=10):
+def top_percentile_obb(box_pc: o3d.geometry.PointCloud, 
+                       percentile=10):
     # Pull out raw points
     pts = np.asarray(box_pc.points)
     zs  = pts[:, 2]
@@ -260,15 +267,20 @@ def top_percentile_obb(box_pc, percentile=10):
     temp_pc = o3d.geometry.PointCloud()
     temp_pc.points = o3d.utility.Vector3dVector(top_pts)
 
-    # Now call your existing plane‐to‐OBB function
+    # Now call existing plane‐to‐OBB function
     corners, length, width = compute_2d_obb_from_lid(temp_pc)
 
     return corners, length, width
 
-def estimate_box_dimensions(box_pc, coverage, lid_inliers, d_lid, d_tab, lid_pc):
+def estimate_box_dimensions(box_pc: o3d.geometry.PointCloud, 
+                            coverage,
+                            lid_inliers, 
+                            d_lid, 
+                            d_tab, 
+                            lid_pc: o3d.geometry.PointCloud):
     # If RANSAC hull is too hollow or no inliers (if angle is too tilted for RANSAC), fall back to top‐percentile outline
     if (coverage < 0.7) or (lid_inliers == None):
-        corners, length, width = top_percentile_obb(box_pc, percentile=20) # top 20 percent of box is used to project to 2D then find XY
+        _ , length, width = top_percentile_obb(box_pc, percentile=20) # top 20 percent of box is used to project to 2D then find XY
         # Compute height from the top 5% of points
         pts = np.asarray(box_pc.points)
         zs  = pts[:, 2]
@@ -360,8 +372,44 @@ if __name__ == "__main__":
     # Estimate box dimensions
     estimate_box_dimensions(box_pc, coverage, lid_inliers, d_lid, d_tab, lid_pc)
 
-    # visualize
+    # Visualize
     obj_pc.paint_uniform_color([1, 0, 0]) # red
     box_pc.paint_uniform_color([0.2, 0.8, 1.0]) # cyan
     lid_pc.paint_uniform_color([0, 1, 0]) # green
     o3d.visualization.draw_geometries([lid_pc, box_pc, table_pc, obj_pc])
+
+    # To Save point cloud
+    UNIT_FACTOR = 1000.0
+
+    # Clone & reverse‐scale each cloud so you don’t mutate your session data
+    def clone_and_rescale(pc):
+        pc2 = o3d.geometry.PointCloud(pc)
+        pc2.scale(UNIT_FACTOR, center=(0, 0, 0))
+        return pc2
+
+    lid_pc_rescaled   = clone_and_rescale(lid_pc)
+    box_pc_rescaled   = clone_and_rescale(box_pc)
+    table_pc_rescaled = clone_and_rescale(table_pc)
+    obj_pc_rescaled   = clone_and_rescale(obj_pc)
+
+    # Stack all points & colors into big NumPy arrays
+    all_pts = np.vstack([
+        np.asarray(lid_pc_rescaled.points),
+        np.asarray(box_pc_rescaled.points),
+        np.asarray(table_pc_rescaled.points),
+        np.asarray(obj_pc_rescaled.points),
+    ])
+    all_clrs = np.vstack([
+        np.asarray(lid_pc_rescaled.colors),
+        np.asarray(box_pc_rescaled.colors),
+        np.asarray(table_pc_rescaled.colors),
+        np.asarray(obj_pc_rescaled.colors),
+    ])
+
+    # Build a new PointCloud and assign the merged data
+    merged_pc = o3d.geometry.PointCloud()
+    merged_pc.points = o3d.utility.Vector3dVector(all_pts)
+    merged_pc.colors = o3d.utility.Vector3dVector(all_clrs)
+
+    # Write out point cloud
+    # o3d.io.write_point_cloud("output_PCD.pcd", merged_pc)
